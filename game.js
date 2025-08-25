@@ -1,260 +1,363 @@
 // MODULE INDEX (game.js)
-// MODULE 1: Config          (sizes, speeds, target count, AI knobs)
-// MODULE 2: Style           (colors, font)
-// MODULE 3: State           (player, targets, score, keys)
-// MODULE 4: Input           (WASD/Arrows → normalized direction)
-// MODULE 5: Helpers         (math + overlap)
-// MODULE 6: Spawn           (spawn N targets; respawn on catch)
-// MODULE 7: AI              (evasion: keep distance, strafe, walls, dash)
-// MODULE 8: Update          (move player/targets, collisions, score)
-// MODULE 9: Render          (border, score, draw)
-// MODULE 10: Loop/Boot      (RAF + fps HUD)
-
-// ---------------------------wwa
 // MODULE 1: Config
-// ---------------------------
-const CFG = {
-  CANVAS_W: 640,
-  CANVAS_H: 480,
-  PLAYER_SIZE: 24,
-  PLAYER_SPEED: 150,
-  TARGET_SIZE: 24,
-  TARGET_COUNT: 1,      // <— amount of targets on screen
-  // AI tuning
-  TARGET_BASE_SPEED: 110,
-  TARGET_MAX_SPEED: 220,
-  TARGET_MAX_ACCEL: 600,
-  DESIRED_DIST: 140,
-  THREAT_DIST: 120,
-  WALL_PAD: 32,
-  JUKE_STRENGTH: 0.8,
-  JITTER: 0.4,
-  DASH_TIME: 5,
-  DASH_COOLDOWN: 9.0,
-  SCORE_SPEED_BOOST: 0.06, // speed scales a bit with score
-};
-
-// ---------------------------
 // MODULE 2: Style
-// ---------------------------
-const STYLE = {
-  PLAYER: '#fbbf24',  // yellow
-  TARGET: '#60a5fa',  // blue
-  BORDER: '#e6eef7',
-  TEXT:   '#e6eef7',
-  SCORE_FONT: '16px system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial'
-};
-
-// ---------------------------
 // MODULE 3: State
-// ---------------------------
-const canvas = document.getElementById('game');
-const ctx = canvas.getContext('2d');
-const hud = document.getElementById('hud');
-
-canvas.width = CFG.CANVAS_W;
-canvas.height = CFG.CANVAS_H;
-
-const player = { x: 120, y: 120, w: CFG.PLAYER_SIZE, h: CFG.PLAYER_SIZE, speed: CFG.PLAYER_SPEED };
-let targets = [];
-let score = 0;
-const keys = new Set();
-
-// ---------------------------
 // MODULE 4: Input
-// ---------------------------
-function mapKey(code){
-  switch(code){
-    case 'KeyW': case 'ArrowUp':    return 'up';
-    case 'KeyS': case 'ArrowDown':  return 'down';
-    case 'KeyA': case 'ArrowLeft':  return 'left';
-    case 'KeyD': case 'ArrowRight': return 'right';
-    default: return null;
-  }
-}
-document.addEventListener('keydown', e => { const k = mapKey(e.code); if (k){ keys.add(k); e.preventDefault(); }});
-document.addEventListener('keyup',   e => { const k = mapKey(e.code); if (k){ keys.delete(k); e.preventDefault(); }});
-
-function readInput(){
-  let dx=0, dy=0;
-  if (keys.has('up')) dy -= 1;
-  if (keys.has('down')) dy += 1;
-  if (keys.has('left')) dx -= 1;
-  if (keys.has('right')) dx += 1;
-  if (dx || dy){
-    const l = Math.hypot(dx,dy) || 1;
-    dx /= l; dy /= l;
-  }
-  return {dx, dy};
-}
-
-// ---------------------------
 // MODULE 5: Helpers
-// ---------------------------
-function clamp(v, min, max){ return Math.max(min, Math.min(max, v)); }
-function rectsOverlap(a, b){
-  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
-}
-function len(x,y){ return Math.hypot(x,y) || 1; }
-function norm(x,y){ const l = len(x,y); return {x:x/l, y:y/l}; }
-function perpendicular(x,y){ return {x:-y, y:x}; }
-function centerX(r){ return r.x + r.w/2; }
-function centerY(r){ return r.y + r.h/2; }
-
-// ---------------------------
-// MODULE 6: Spawn
-// ---------------------------
-function spawnOneTarget(avoidRect){
-  const w = CFG.TARGET_SIZE, h = CFG.TARGET_SIZE;
-  // try to avoid spawning on player
-  for (let i = 0; i < 20; i++){
-    const x = Math.random() * (CFG.CANVAS_W - w);
-    const y = Math.random() * (CFG.CANVAS_H - h);
-    const t = {
-      x, y, w, h,
-      vx: 0, vy: 0,
-      // per-target tuning (can be adjusted at runtime if you want)
-      baseSpeed: CFG.TARGET_BASE_SPEED,
-      maxSpeed:  CFG.TARGET_MAX_SPEED,
-      maxAccel:  CFG.TARGET_MAX_ACCEL,
-      desiredDist: CFG.DESIRED_DIST,
-      threatDist:  CFG.THREAT_DIST,
-      wallPad:     CFG.WALL_PAD,
-      jukeStrength: CFG.JUKE_STRENGTH,
-      jitter:       CFG.JITTER,
-      dashCooldown: 0,
-      dashTime:     0
-    };
-    if (!rectsOverlap(avoidRect, t)) return t;
-  }
-  // fallback
-  return { x: CFG.CANVAS_W - w - 10, y: CFG.CANVAS_H - h - 10, w, h, vx:0, vy:0,
-    baseSpeed: CFG.TARGET_BASE_SPEED, maxSpeed: CFG.TARGET_MAX_SPEED, maxAccel: CFG.TARGET_MAX_ACCEL,
-    desiredDist: CFG.DESIRED_DIST, threatDist: CFG.THREAT_DIST, wallPad: CFG.WALL_PAD,
-    jukeStrength: CFG.JUKE_STRENGTH, jitter: CFG.JITTER, dashCooldown: 0, dashTime: 0
-  };
-}
-
-function ensureTargetCount(){
-  while (targets.length < CFG.TARGET_COUNT){
-    targets.push(spawnOneTarget(player));
-  }
-}
-
-// ---------------------------
+// MODULE 6: Spawning & Cap (time-based)
 // MODULE 7: AI (evasion)
-// ---------------------------
+// MODULE 8: Update (drain, catch-all regen, time cap)
+// MODULE 9: Render (score, HP, targets info, game over)
+// MODULE 10: Loop/Boot
+
+(function(){
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  // ---------------------------
+  // MODULE 1: Config
+  // ---------------------------
+  const CFG = {
+    PLAYER_SIZE: 24,
+    PLAYER_SPEED: 240,
+
+    TARGET_SIZE: 24,
+    TARGET_MAX_SPEED: 220,
+    TARGET_MAX_ACCEL: 600,
+    JUKE_STRENGTH: 0.8,
+    JITTER: 0.35,
+
+    HEALTH_MAX: 100,
+    HEALTH_DECAY_PER_SEC: 8,
+    HEALTH_REFILL_ON_CLEAR: 100, // full heal on clearing all current cubes
+
+    TIME_STEP_SEC: 30 // every 30s, cap += 1 (1→2→3…)
+  };
+
+  // ---------------------------
+  // MODULE 2: Style
+  // ---------------------------
+  const STYLE = {
+    PLAYER: '#fbbf24',
+    TARGET: '#60a5fa',
+    BORDER: '#e6eef7',
+    TEXT:   '#e6eef7',
+    SCORE_FONT: '16px system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial',
+    HP_BG:  '#273646',
+    HP_OK:  '#86efac',
+    HP_LOW: '#fca5a5',
+    HP_BORDER: '#1e2a36'
+  };
+
+  // ---------------------------
+  // MODULE 3: State
+  // ---------------------------
+  const player = { x: 120, y: 120, w: CFG.PLAYER_SIZE, h: CFG.PLAYER_SIZE, speed: CFG.PLAYER_SPEED };
+  const keys = new Set();
+  let score = 0;
+  let hp = CFG.HEALTH_MAX;
+  let alive = true;
+
+  let elapsed = 0;       // seconds since run start
+  let targets = [];      // active cubes
+
+  // ---------------------------
+  // MODULE 4: Input
+  // ---------------------------
+  function mapKey(code){
+    switch(code){
+      case 'KeyW': case 'ArrowUp':    return 'up';
+      case 'KeyS': case 'ArrowDown':  return 'down';
+      case 'KeyA': case 'ArrowLeft':  return 'left';
+      case 'KeyD': case 'ArrowRight': return 'right';
+      case 'Space':                   return 'space';
+      default: return null;
+    }
+  }
+  document.addEventListener('keydown', e => { const k = mapKey(e.code); if (k){ keys.add(k); e.preventDefault(); }});
+  document.addEventListener('keyup',   e => { const k = mapKey(e.code); if (k){ keys.delete(k); e.preventDefault(); }});
+
+  function readInput(){
+    let dx=0, dy=0;
+    if (keys.has('up')) dy -= 1;
+    if (keys.has('down')) dy += 1;
+    if (keys.has('left')) dx -= 1;
+    if (keys.has('right')) dx += 1;
+    if (dx || dy){ const l = Math.hypot(dx,dy) || 1; dx/=l; dy/=l; }
+    return {dx, dy};
+  }
+
+  // ---------------------------
+  // MODULE 5: Helpers
+  // ---------------------------
+  function clamp(v,min,max){return Math.max(min,Math.min(max,v));}
+  function rectsOverlap(a,b){
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+  function len(x,y){return Math.hypot(x,y)||1;}
+  function norm(x,y){const l=len(x,y); return {x:x/l,y:y/l};}
+
+  // ---------------------------
+  // MODULE 6: Spawning & Cap (time-based)
+  // ---------------------------
+  function makeTarget(){
+    const w=CFG.TARGET_SIZE, h=CFG.TARGET_SIZE;
+    return {
+      x: Math.random() * (canvas.width  - w),
+      y: Math.random() * (canvas.height - h),
+      w, h,
+      vx:0, vy:0
+    };
+  }
+
+  function spawnAvoidingPlayer(){
+    const w=CFG.TARGET_SIZE, h=CFG.TARGET_SIZE;
+    for(let i=0;i<20;i++){
+      const t = makeTarget();
+      if (!rectsOverlap(player, t)) return t;
+    }
+    // fallback
+    return { x: canvas.width-w-10, y: canvas.height-h-10, w, h, vx:0, vy:0 };
+  }
+
+  function targetCap(){
+    return 1 + Math.floor(elapsed / CFG.TIME_STEP_SEC);
+  }
+
+  function ensureCap(){
+    const cap = targetCap();
+    while (targets.length < cap){
+      targets.push(spawnAvoidingPlayer());
+    }
+  }
+
+// MODULE 7: AI (evasion)
+// Less predictable: occasional fast turns ("zigs"), light wandering when far,
+// separation so they don't bunch, and wall-slide if pinned.
 function updateTargetAI(t, dt){
-  const difficultyBoost = Math.min(1, score * CFG.SCORE_SPEED_BOOST); // up to +100% * 0.06 = +60%
-  const wantSpeed = t.baseSpeed * (1 + 0.6 * difficultyBoost);
+  // --- local knobs (tune here)
+  const SEP_RADIUS   = 80;     // how far they repel each other
+  const SEP_FORCE    = 0.8;    // strength of that repulsion
+  const WANDER_FREQ  = 1.2;    // lower = more frequent small direction shifts
+  const WANDER_STRENGTH = 0.6; // magnitude of those shifts
+  const ZIG_DIST     = 220;    // start a quick turn if you're within this distance
+  const ZIG_TIME     = 0.18;   // seconds per zig burst
+  const ZIG_COOLDOWN = 0.9;    // minimal cooldown between zigs
+  const ZIG_FORCE    = 1.35;   // how strong the zig lateral shove is
+  const SLIDE_FORCE  = 1.0;    // bias along walls when near them
 
-  const cx = centerX(t), cy = centerY(t);
-  const px = centerX(player), py = centerY(player);
-
-  const toPlayer = { x: px - cx, y: py - cy };
-  const away = norm(-toPlayer.x, -toPlayer.y);
-  const dist = len(toPlayer.x, toPlayer.y);
-
-  // Flee weight scales down when far
-  let fleeWeight = 1.0;
-  if (dist > t.desiredDist) fleeWeight = 0.4 * (t.desiredDist / dist);
-
-  // Strafe (sideways oscillation)
-  const side = perpendicular(away.x, away.y);
-  const osc = Math.sin(performance.now() * 0.005 + score);
-  const strafe = { x: side.x * osc, y: side.y * osc };
-
-  // Wall avoidance
-  let wall = {x:0, y:0};
-  if (cx < t.wallPad) wall.x += 1;
-  if (cy < t.wallPad) wall.y += 1;
-  if (cx > CFG.CANVAS_W  - t.wallPad) wall.x -= 1;
-  if (cy > CFG.CANVAS_H - t.wallPad) wall.y -= 1;
-  if (wall.x || wall.y) wall = norm(wall.x, wall.y);
-
-  // Panic dash
-  t.dashCooldown = Math.max(0, t.dashCooldown - dt);
-  t.dashTime     = Math.max(0, t.dashTime - dt);
-  if (dist < t.threatDist && t.dashCooldown === 0) {
-    t.dashTime = CFG.DASH_TIME;
-    t.dashCooldown = CFG.DASH_COOLDOWN;
-  }
-  const dashMult = t.dashTime > 0 ? 1.8 : 1.0;
-
-  // Random jitter
-  const jitter = { x: (Math.random()-0.5) * t.jitter, y: (Math.random()-0.5) * t.jitter };
-
-  // Combine steering
-  let steerX = away.x*fleeWeight + strafe.x*t.jukeStrength + wall.x*1.2 + jitter.x*0.6;
-  let steerY = away.y*fleeWeight + strafe.y*t.jukeStrength + wall.y*1.2 + jitter.y*0.6;
-
-  // Acceleration
-  const s = norm(steerX, steerY);
-  const ax = s.x * t.maxAccel * dt;
-  const ay = s.y * t.maxAccel * dt;
-
-  // Integrate velocity
-  t.vx += ax; t.vy += ay;
-
-  // Cap speed near wantSpeed (scaled by dash)
-  const vlen = len(t.vx, t.vy);
-  const cap = Math.min(t.maxSpeed, wantSpeed * dashMult);
-  if (vlen > cap){
-    const u = { x: t.vx / vlen, y: t.vy / vlen };
-    t.vx = u.x * cap; t.vy = u.y * cap;
+  // init one-time fields
+  if (t.zigTime === undefined){
+    t.zigTime = 0;
+    t.zigCooldown = 0;
+    t.wanderPhase = Math.random() * Math.PI * 2;
+    t.wanderTimer = 0;
+    t.lastSteerX = 0; t.lastSteerY = 0; // for smoothing
   }
 
-  // Move
+  // centers
+  const cx = t.x + t.w/2, cy = t.y + t.h/2;
+  const px = player.x + player.w/2, py = player.y + player.h/2;
+
+  // --- base flee + mild strafe (but not 100% away every frame)
+  const toX = px - cx, toY = py - cy;
+  const d   = Math.hypot(toX, toY) || 1;
+  const awayX = -toX / d, awayY = -toY / d;
+  const sideX = -awayY, sideY = awayX;
+
+  // Start with a softer flee (so they don't beeline to the opposite corner)
+  let steerX = awayX * 0.8 + sideX * (CFG.JUKE_STRENGTH * 0.6);
+  let steerY = awayY * 0.8 + sideY * (CFG.JUKE_STRENGTH * 0.6);
+
+  // --- separation: push away from nearby targets (de-bunch)
+  let sepX = 0, sepY = 0;
+  for (let i = 0; i < targets.length; i++){
+    const o = targets[i]; if (o === t) continue;
+    const dx = (cx - (o.x + o.w/2)), dy = (cy - (o.y + o.h/2));
+    const dist = Math.hypot(dx, dy);
+    if (dist > 0 && dist < SEP_RADIUS){
+      const s = (SEP_RADIUS - dist) / SEP_RADIUS;
+      sepX += (dx / dist) * s;
+      sepY += (dy / dist) * s;
+    }
+  }
+  if (sepX || sepY){
+    const l = Math.hypot(sepX, sepY) || 1;
+    steerX += (sepX / l) * SEP_FORCE;
+    steerY += (sepY / l) * SEP_FORCE;
+  }
+
+  // --- wall-slide: if hugging a wall, bias along it away from player
+  const nearLeft   = t.x < 12, nearRight = t.x > canvas.width - t.w - 12;
+  const nearTop    = t.y < 12, nearBottom= t.y > canvas.height - t.h - 12;
+  if (nearLeft || nearRight){
+    // slide up/down such that distance from player increases
+    steerY += (cy > py ? 1 : -1) * SLIDE_FORCE;
+  }
+  if (nearTop || nearBottom){
+    // slide left/right such that distance from player increases
+    steerX += (cx > px ? 1 : -1) * SLIDE_FORCE;
+  }
+
+  // --- WANDER: small, slow heading changes when far so paths aren't straight
+  t.wanderTimer -= dt;
+  if (t.wanderTimer <= 0){
+    t.wanderTimer = WANDER_FREQ + Math.random() * 0.6; // jitter the frequency
+    t.wanderPhase += (Math.random() - 0.5) * 1.2;
+  }
+  const wanderX = Math.cos(t.wanderPhase) * WANDER_STRENGTH * (d > ZIG_DIST ? 1 : 0.4);
+  const wanderY = Math.sin(t.wanderPhase) * WANDER_STRENGTH * (d > ZIG_DIST ? 1 : 0.4);
+  steerX += wanderX; steerY += wanderY;
+
+  // --- ZIG: quick lateral burst when you're close (fast turn / direction swap)
+  t.zigCooldown = Math.max(0, t.zigCooldown - dt);
+  t.zigTime     = Math.max(0, t.zigTime - dt);
+
+  if (d < ZIG_DIST && t.zigCooldown === 0 && t.zigTime === 0){
+    // pick a lateral direction that doesn't push straight into a nearby wall
+    const leftSpace  = cx > canvas.width * 0.33;
+    const rightSpace = cx < canvas.width * 0.66;
+    const upSpace    = cy > canvas.height * 0.33;
+    const downSpace  = cy < canvas.height * 0.66;
+
+    // two options: +side or -side; choose the one with more space
+    const opt1 = { x: sideX,  y: sideY };
+    const opt2 = { x: -sideX, y: -sideY };
+    const favor1 = (opt1.x < 0 ? leftSpace : rightSpace) + (opt1.y < 0 ? upSpace : downSpace);
+    const favor2 = (opt2.x < 0 ? leftSpace : rightSpace) + (opt2.y < 0 ? upSpace : downSpace);
+    t.zigDirX = favor1 >= favor2 ? opt1.x : opt2.x;
+    t.zigDirY = favor1 >= favor2 ? opt1.y : opt2.y;
+
+    t.zigTime = ZIG_TIME;
+    t.zigCooldown = ZIG_COOLDOWN + Math.random()*0.4; // slight randomness
+  }
+
+  if (t.zigTime > 0){
+    steerX += t.zigDirX * ZIG_FORCE;
+    steerY += t.zigDirY * ZIG_FORCE;
+  }
+
+  // --- tiny randomness so they don't loop perfectly
+  steerX += (Math.random() - 0.5) * CFG.JITTER;
+  steerY += (Math.random() - 0.5) * CFG.JITTER;
+
+  // --- accelerate toward steer, with a touch of smoothing to avoid twitch
+  const sL = Math.hypot(steerX, steerY) || 1;
+  let ax = (steerX / sL), ay = (steerY / sL);
+  // blend with previous frame's steer for smoother headings
+  const SMOOTH = 0.65;
+  ax = ax * (1 - SMOOTH) + (t.lastSteerX || 0) * SMOOTH;
+  ay = ay * (1 - SMOOTH) + (t.lastSteerY || 0) * SMOOTH;
+  t.lastSteerX = ax; t.lastSteerY = ay;
+
+  t.vx += ax * CFG.TARGET_MAX_ACCEL * dt;
+  t.vy += ay * CFG.TARGET_MAX_ACCEL * dt;
+
+  // cap speed
+  const vL = Math.hypot(t.vx, t.vy) || 1;
+  if (vL > CFG.TARGET_MAX_SPEED){
+    t.vx = (t.vx / vL) * CFG.TARGET_MAX_SPEED;
+    t.vy = (t.vy / vL) * CFG.TARGET_MAX_SPEED;
+  }
+
+  // move
   t.x += t.vx * dt; t.y += t.vy * dt;
 
-  // Stay inside; soften bounce
-  if (t.x < 0){ t.x = 0; t.vx = Math.abs(t.vx)*0.7; }
-  if (t.y < 0){ t.y = 0; t.vy = Math.abs(t.vy)*0.7; }
-  if (t.x > CFG.CANVAS_W - t.w){ t.x = CFG.CANVAS_W - t.w; t.vx = -Math.abs(t.vx)*0.7; }
-  if (t.y > CFG.CANVAS_H - t.h){ t.y = CFG.CANVAS_H - t.h; t.vy = -Math.abs(t.vy)*0.7; }
+  // contain + soft bounce
+  if (t.x < 0){ t.x = 0; t.vx = Math.abs(t.vx) * 0.7; }
+  if (t.y < 0){ t.y = 0; t.vy = Math.abs(t.vy) * 0.7; }
+  if (t.x > canvas.width - t.w){ t.x = canvas.width - t.w; t.vx = -Math.abs(t.vx) * 0.7; }
+  if (t.y > canvas.height - t.h){ t.y = canvas.height - t.h; t.vy = -Math.abs(t.vy) * 0.7; }
 }
 
-// ---------------------------
-// MODULE 8: Update
-// ---------------------------
+
+
+// MODULE 8: Update (drain, catch-all regen, time cap)
+function restart(){
+  score = 0;
+  hp = CFG.HEALTH_MAX;
+  alive = true;
+  elapsed = 0;
+  targets.length = 0;
+  // spawn to current cap at start (1)
+  const cap = targetCap();
+  while (targets.length < cap) targets.push(spawnAvoidingPlayer());
+}
+
 function update(dt){
-  // player
+  if (!alive){
+    if (keys.has('space')) restart();
+    return;
+  }
+
+  elapsed += dt;
+
+  // health drain
+  hp -= CFG.HEALTH_DECAY_PER_SEC * dt;
+  hp = clamp(hp, 0, CFG.HEALTH_MAX);
+  if (hp <= 0){ alive = false; return; }
+
+  // player movement
   const dir = readInput();
   player.x += dir.dx * player.speed * dt;
   player.y += dir.dy * player.speed * dt;
-  player.x = clamp(player.x, 0, CFG.CANVAS_W - player.w);
-  player.y = clamp(player.y, 0, CFG.CANVAS_H - player.h);
+  player.x = clamp(player.x, 0, canvas.width  - player.w);
+  player.y = clamp(player.y, 0, canvas.height - player.h);
 
-  // targets
+  // update targets + collect
   for (let i = targets.length - 1; i >= 0; i--){
     const t = targets[i];
     updateTargetAI(t, dt);
     if (rectsOverlap(player, t)){
-      // caught
       score += 1;
       targets.splice(i, 1);
     }
   }
 
-  // keep count
-  ensureTargetCount();
+  // ✅ Only when ALL current cubes are cleared:
+  if (targets.length === 0){
+    // regen health
+    hp = clamp(hp + CFG.HEALTH_REFILL_ON_CLEAR, 0, CFG.HEALTH_MAX);
+    // spawn up to current time-based cap
+    const cap = targetCap();
+    while (targets.length < cap) targets.push(spawnAvoidingPlayer());
+  }
+
+  // ⛔️ No unconditional "ensureCap()" here — that was causing mid-wave respawns.
 }
 
-// ---------------------------
-// MODULE 9: Render
-// ---------------------------
+
+// MODULE 9: Render (score, HP, targets info, game over)
+function drawHealth(){
+  const pad = 12, barW = canvas.width - pad*2, barH = 12, x = pad, y = 44;
+  ctx.fillStyle = STYLE.HP_BG; ctx.fillRect(x, y, barW, barH);
+  const pct = hp / CFG.HEALTH_MAX;
+  ctx.fillStyle = (pct < 0.3) ? STYLE.HP_LOW : STYLE.HP_OK;
+  ctx.fillRect(x, y, barW * pct, barH);
+  ctx.strokeStyle = STYLE.HP_BORDER; ctx.strokeRect(x + 0.5, y + 0.5, barW - 1, barH - 1);
+}
+
 function render(){
-  ctx.clearRect(0,0,CFG.CANVAS_W, CFG.CANVAS_H);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
 
   // border
-  ctx.strokeStyle = STYLE.BORDER;
-  ctx.lineWidth = 2;
-  ctx.strokeRect(1,1,CFG.CANVAS_W-2,CFG.CANVAS_H-2);
+  ctx.strokeStyle = STYLE.BORDER; ctx.lineWidth = 2;
+  ctx.strokeRect(1,1,canvas.width-2,canvas.height-2);
 
-  // score
+  // left HUD: score
   ctx.fillStyle = STYLE.TEXT;
   ctx.font = STYLE.SCORE_FONT;
+  ctx.textAlign = 'left';
   ctx.fillText(`Score: ${score}`, 12, 22);
+
+  // right HUD: targets
+  const cap = targetCap();
+  ctx.textAlign = 'right';
+  ctx.fillText(`Targets: ${targets.length}/${cap}`, canvas.width - 12, 22);
+  ctx.textAlign = 'left'; // restore default for other text
+
+  // health bar
+  drawHealth();
 
   // targets
   ctx.fillStyle = STYLE.TARGET;
@@ -263,28 +366,28 @@ function render(){
   // player
   ctx.fillStyle = STYLE.PLAYER;
   ctx.fillRect(player.x, player.y, player.w, player.h);
+
+  // game over
+  if (!alive){
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle = STYLE.TEXT;
+    ctx.font = '24px system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial';
+    ctx.fillText('Game Over', 12, 100);
+    ctx.font = '16px system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial';
+    ctx.fillText('Press Space to restart', 12, 130);
+  }
 }
 
-// ---------------------------
-// MODULE 10: Loop/Boot
-// ---------------------------
-canvas.focus();
-let last = performance.now(), acc=0, frames=0, fps=0;
-function frame(t){
-  const dt = Math.min(0.033, (t - last)/1000);
-  last = t;
-  update(dt);
-  render();
-  // fps hud
-  acc += dt; frames++;
-  if (acc >= 0.5){ fps = Math.round(frames/acc); hud.textContent = `fps: ${fps}`; acc=0; frames=0; }
-  requestAnimationFrame(frame);
-}
 
-// boot
-function boot(){
-  targets = [];
-  ensureTargetCount();
-  requestAnimationFrame(frame);
-}
-boot();
+  // ---------------------------
+  // MODULE 10: Loop/Boot
+  // ---------------------------
+  let last = performance.now();
+  function frame(t){
+    const dt = Math.min(0.033, (t - last)/1000); last = t;
+    update(dt); render(); requestAnimationFrame(frame);
+  }
+  function boot(){ restart(); requestAnimationFrame(frame); }
+  boot();
+})();
