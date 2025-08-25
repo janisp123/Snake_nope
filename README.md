@@ -22,8 +22,3 @@ A bare-bones browser game made with plain JavaScript and Canvas.
 ## Requirements
 - A modern browser (Chrome, Edge, Firefox, Safari).
 - Keyboard input enabled (WASD or Arrow keys).
-
-## Next Steps (optional)
-- Add restart button or game-over conditions.
-- Multiple targets or timed spawning.
-- Sound effects and visual polish.
