@@ -1,9 +1,15 @@
+<!-- MODULE INDEX (index.html)
+  MODULE 1: <head> + inline styles
+  MODULE 2: Body structure (HUD + Canvas)
+  MODULE 3: Script include
+-->
 <!doctype html>
 <html lang="en">
 <head>
+  <!-- MODULE 1: <head> + inline styles -->
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Minimal Cube Collector</title>
+  <title>Cube Collector</title>
   <style>
     :root { color-scheme: dark; }
     html, body { height: 100%; margin: 0; }
@@ -15,12 +21,14 @@
   </style>
 </head>
 <body>
+<!-- MODULE 2: Body structure (HUD + Canvas) -->
 <div id="wrap">
   <div id="hud">fps: —</div>
   <canvas id="game" width="640" height="480" tabindex="0"></canvas>
-  <div class="hint">WASD or Arrow Keys to move. Touch the blue square.</div>
+  <div class="hint">WASD / Arrows to move. Catch the blue cubes.</div>
 </div>
-<!-- plain script, no modules -->
+
+<!-- MODULE 3: Script include -->
 <script src="./game.js"></script>
 </body>
 </html>
