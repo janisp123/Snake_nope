@@ -131,144 +131,506 @@
     }
   }
 
-// MODULE 7: AI (evasion)
-// Less predictable: occasional fast turns ("zigs"), light wandering when far,
-// separation so they don't bunch, and wall-slide if pinned.
-function updateTargetAI(t, dt){
-  // --- local knobs (tune here)
-  const SEP_RADIUS   = 80;     // how far they repel each other
-  const SEP_FORCE    = 0.8;    // strength of that repulsion
-  const WANDER_FREQ  = 1.2;    // lower = more frequent small direction shifts
-  const WANDER_STRENGTH = 0.6; // magnitude of those shifts
-  const ZIG_DIST     = 220;    // start a quick turn if you're within this distance
-  const ZIG_TIME     = 0.18;   // seconds per zig burst
-  const ZIG_COOLDOWN = 0.9;    // minimal cooldown between zigs
-  const ZIG_FORCE    = 1.35;   // how strong the zig lateral shove is
-  const SLIDE_FORCE  = 1.0;    // bias along walls when near them
+// MODULE 7.1: AI_CFG — knobs & switches (small, safe to tweak)
+const AI_CFG = {
+  SEP_RADIUS: 90,
+  SEP_FORCE: 0.9,
 
-  // init one-time fields
-  if (t.zigTime === undefined){
-    t.zigTime = 0;
-    t.zigCooldown = 0;
-    t.wanderPhase = Math.random() * Math.PI * 2;
-    t.wanderTimer = 0;
-    t.lastSteerX = 0; t.lastSteerY = 0; // for smoothing
+  ORBIT_DIST: 260,
+  ORBIT_FORCE: 0.85,
+
+  WALL_REPEL_MARGIN: 60,
+  SLIDE_FORCE: 1.15,
+
+  // Jukes
+  JUKE_CLOSE_DIST: 190,   // start thinking about juking here
+  JUKE_TRIGGER_ANGLE: 0.85, // cos(theta). ~> player heading mostly at target
+  JUKE_COOLDOWN: 1.1,
+  JUKE_DURATION: 0.14,
+  JUKE_PUSH: 1.65,
+
+  // Anti-corner patrol
+  CORNER_NEAR_EDGE: 12,
+  PATROL_COOLDOWN: 1.6,
+  PATROL_TIME: 0.5,
+  PATROL_PUSH: 0.9,
+  SAFE_BAND: 120, // “aim toward this band away from edges when idle”
+
+  // Wander
+  WANDER_T: 0.9,
+  WANDER_MAG_FAR: 0.8,
+  WANDER_MAG_NEAR: 0.35,
+
+  // Misc
+  PANIC_SPEED_UP: 1.12,
+  JITTER: 0.28,
+  SMOOTH: 0.6,
+  LEAD: 0.22, // seconds predict player
+};
+
+
+// MODULE 7.2: AI_STATE — per-target lazy init + helpers
+function aiInit(t){
+  if (t._ai) return;
+  t._ai = {
+    wanderTimer: Math.random()*AI_CFG.WANDER_T,
+    wanderPhase: Math.random()*Math.PI*2,
+    lastSteerX: 0, lastSteerY: 0,
+
+    // Juke
+    jukeTime: 0,
+    jukeCool: 0,
+    jukeDirX: 0, jukeDirY: 0,
+
+    // Patrol
+    patrolTime: 0,
+    patrolCool: 0,
+    patrolDirX: 0, patrolDirY: 0,
+  };
+}
+
+function aiPredictPlayer() {
+  let dx=0, dy=0;
+  if (typeof readInput === 'function'){
+    const di = readInput(); dx = di.dx; dy = di.dy;
   }
+  const px = (player.x + player.w/2) + dx * player.speed * AI_CFG.LEAD;
+  const py = (player.y + player.h/2) + dy * player.speed * AI_CFG.LEAD;
+  const hv = Math.hypot(dx,dy); // player heading magnitude (0..1)
+  return {px, py, hx:dx, hy:dy, hv};
+}
 
-  // centers
+function aiNearEdges(t){
+  const L = t.x < AI_CFG.CORNER_NEAR_EDGE;
+  const R = t.x > canvas.width - t.w - AI_CFG.CORNER_NEAR_EDGE;
+  const T = t.y < AI_CFG.CORNER_NEAR_EDGE;
+  const B = t.y > canvas.height - t.h - AI_CFG.CORNER_NEAR_EDGE;
+  return {L,R,T,B, inCorner: (L||R)&&(T||B)};
+}
+
+
+// MODULE 7.3: AI_STEER_BASE — flee/orbit + separation + walls
+function aiSteerBase(t, pred){
+  const {px, py} = pred;
   const cx = t.x + t.w/2, cy = t.y + t.h/2;
-  const px = player.x + player.w/2, py = player.y + player.h/2;
-
-  // --- base flee + mild strafe (but not 100% away every frame)
   const toX = px - cx, toY = py - cy;
   const d   = Math.hypot(toX, toY) || 1;
-  const awayX = -toX / d, awayY = -toY / d;
-  const sideX = -awayY, sideY = awayX;
 
-  // Start with a softer flee (so they don't beeline to the opposite corner)
-  let steerX = awayX * 0.8 + sideX * (CFG.JUKE_STRENGTH * 0.6);
-  let steerY = awayY * 0.8 + sideY * (CFG.JUKE_STRENGTH * 0.6);
+  const awayX = -toX/d, awayY = -toY/d;
+  const tangX = -awayY,  tangY =  awayX;
 
-  // --- separation: push away from nearby targets (de-bunch)
-  let sepX = 0, sepY = 0;
-  for (let i = 0; i < targets.length; i++){
-    const o = targets[i]; if (o === t) continue;
-    const dx = (cx - (o.x + o.w/2)), dy = (cy - (o.y + o.h/2));
-    const dist = Math.hypot(dx, dy);
-    if (dist > 0 && dist < SEP_RADIUS){
-      const s = (SEP_RADIUS - dist) / SEP_RADIUS;
-      sepX += (dx / dist) * s;
-      sepY += (dy / dist) * s;
+  const near = Math.min(1, Math.max(0, (AI_CFG.ORBIT_DIST - d)/AI_CFG.ORBIT_DIST));
+  let sx = awayX * (0.75 + 0.25*near) + tangX * (AI_CFG.ORBIT_FORCE * near);
+  let sy = awayY * (0.75 + 0.25*near) + tangY * (AI_CFG.ORBIT_FORCE * near);
+
+  // Separation
+  let sepX=0, sepY=0;
+  for (let i=0;i<targets.length;i++){
+    const o = targets[i]; if (o===t) continue;
+    const ox = o.x + o.w/2, oy = o.y + o.h/2;
+    const dx = cx - ox, dy = cy - oy, dist = Math.hypot(dx,dy);
+    if (dist>0 && dist<AI_CFG.SEP_RADIUS){
+      const s = (AI_CFG.SEP_RADIUS - dist)/AI_CFG.SEP_RADIUS;
+      sepX += (dx/dist)*s; sepY += (dy/dist)*s;
     }
   }
-  if (sepX || sepY){
-    const l = Math.hypot(sepX, sepY) || 1;
-    steerX += (sepX / l) * SEP_FORCE;
-    steerY += (sepY / l) * SEP_FORCE;
+  if (sepX||sepY){
+    const sl = Math.hypot(sepX,sepY)||1;
+    sx += (sepX/sl)*AI_CFG.SEP_FORCE;
+    sy += (sepY/sl)*AI_CFG.SEP_FORCE;
   }
 
-  // --- wall-slide: if hugging a wall, bias along it away from player
-  const nearLeft   = t.x < 12, nearRight = t.x > canvas.width - t.w - 12;
-  const nearTop    = t.y < 12, nearBottom= t.y > canvas.height - t.h - 12;
-  if (nearLeft || nearRight){
-    // slide up/down such that distance from player increases
-    steerY += (cy > py ? 1 : -1) * SLIDE_FORCE;
-  }
-  if (nearTop || nearBottom){
-    // slide left/right such that distance from player increases
-    steerX += (cx > px ? 1 : -1) * SLIDE_FORCE;
-  }
+  // Wall repel + slide
+  const m = AI_CFG.WALL_REPEL_MARGIN;
+  if (t.x < m)                                   sx += (cx > px ? 0.4 : 0.2);
+  if (t.x > canvas.width - t.w - m)              sx += (cx < px ? -0.4 : -0.2);
+  if (t.y < m)                                   sy += (cy > py ? 0.4 : 0.2);
+  if (t.y > canvas.height - t.h - m)             sy += (cy < py ? -0.4 : -0.2);
+  const edge = aiNearEdges(t);
+  if (edge.L || edge.R) sy += (cy > py ? 1 : -1) * AI_CFG.SLIDE_FORCE;
+  if (edge.T || edge.B) sx += (cx > px ? 1 : -1) * AI_CFG.SLIDE_FORCE;
 
-  // --- WANDER: small, slow heading changes when far so paths aren't straight
-  t.wanderTimer -= dt;
-  if (t.wanderTimer <= 0){
-    t.wanderTimer = WANDER_FREQ + Math.random() * 0.6; // jitter the frequency
-    t.wanderPhase += (Math.random() - 0.5) * 1.2;
-  }
-  const wanderX = Math.cos(t.wanderPhase) * WANDER_STRENGTH * (d > ZIG_DIST ? 1 : 0.4);
-  const wanderY = Math.sin(t.wanderPhase) * WANDER_STRENGTH * (d > ZIG_DIST ? 1 : 0.4);
-  steerX += wanderX; steerY += wanderY;
+  return {sx, sy, d, cx, cy};
+}
 
-  // --- ZIG: quick lateral burst when you're close (fast turn / direction swap)
-  t.zigCooldown = Math.max(0, t.zigCooldown - dt);
-  t.zigTime     = Math.max(0, t.zigTime - dt);
 
-  if (d < ZIG_DIST && t.zigCooldown === 0 && t.zigTime === 0){
-    // pick a lateral direction that doesn't push straight into a nearby wall
-    const leftSpace  = cx > canvas.width * 0.33;
-    const rightSpace = cx < canvas.width * 0.66;
-    const upSpace    = cy > canvas.height * 0.33;
-    const downSpace  = cy < canvas.height * 0.66;
+// MODULE 7.4: AI_JUKE — timed lateral bursts when player bears down
+function aiApplyJuke(t, base, pred, dt){
+  const s = t._ai;
+  // cooldown timers
+  s.jukeCool = Math.max(0, s.jukeCool - dt);
+  s.jukeTime = Math.max(0, s.jukeTime - dt);
 
-    // two options: +side or -side; choose the one with more space
-    const opt1 = { x: sideX,  y: sideY };
-    const opt2 = { x: -sideX, y: -sideY };
-    const favor1 = (opt1.x < 0 ? leftSpace : rightSpace) + (opt1.y < 0 ? upSpace : downSpace);
-    const favor2 = (opt2.x < 0 ? leftSpace : rightSpace) + (opt2.y < 0 ? upSpace : downSpace);
-    t.zigDirX = favor1 >= favor2 ? opt1.x : opt2.x;
-    t.zigDirY = favor1 >= favor2 ? opt1.y : opt2.y;
+  const {px, py, hx, hy, hv} = pred;
+  const {cx, cy, d} = base;
 
-    t.zigTime = ZIG_TIME;
-    t.zigCooldown = ZIG_COOLDOWN + Math.random()*0.4; // slight randomness
+  // If already juking, apply ongoing push
+  if (s.jukeTime > 0){
+    base.sx += s.jukeDirX * AI_CFG.JUKE_PUSH;
+    base.sy += s.jukeDirY * AI_CFG.JUKE_PUSH;
+    return base;
   }
 
-  if (t.zigTime > 0){
-    steerX += t.zigDirX * ZIG_FORCE;
-    steerY += t.zigDirY * ZIG_FORCE;
+  // Consider starting a juke if close and player heading largely toward target
+  if (d < AI_CFG.JUKE_CLOSE_DIST && s.jukeCool === 0 && hv > 0.3){
+    const toTX = cx - (player.x + player.w/2);
+    const toTY = cy - (player.y + player.h/2);
+    const toTL = Math.hypot(toTX,toTY)||1;
+    const nhx = hx/(Math.hypot(hx,hy)||1), nhy = hy/(Math.hypot(hx,hy)||1);
+    const dot = ( (toTX/toTL)*nhx + (toTY/toTL)*nhy ); // cos(theta)
+
+    if (dot > AI_CFG.JUKE_TRIGGER_ANGLE){
+      // Choose lateral dir perpendicular to away vector
+      const awayX = (cx - px) / (Math.hypot(cx-px, cy-py)||1);
+      const awayY = (cy - py) / (Math.hypot(cx-px, cy-py)||1);
+      // Two options: left/right
+      const lx = -awayY, ly =  awayX;
+      const rx =  awayY, ry = -awayX;
+
+      // Pick the one that increases distance from predicted player point
+      const sL = (cx + lx*40 - px)**2 + (cy + ly*40 - py)**2;
+      const sR = (cx + rx*40 - px)**2 + (cy + ry*40 - py)**2;
+      if (sL > sR){ s.jukeDirX = lx; s.jukeDirY = ly; }
+      else        { s.jukeDirX = rx; s.jukeDirY = ry; }
+
+      s.jukeTime = AI_CFG.JUKE_DURATION;
+      s.jukeCool = AI_CFG.JUKE_COOLDOWN + Math.random()*0.4;
+    }
+  }
+  return base;
+}
+
+
+  // MODULE 7.5: AI_PATROL — proactive anti-corner if player not near
+  function aiApplyPatrol(t, base, pred, dt){
+    const s = t._ai;
+    s.patrolCool = Math.max(0, s.patrolCool - dt);
+    s.patrolTime = Math.max(0, s.patrolTime - dt);
+
+    const {cx, cy, d} = base;
+    const edge = aiNearEdges(t);
+
+    // If already patrolling, keep nudging off edges
+    if (s.patrolTime > 0){
+      base.sx += s.patrolDirX * AI_CFG.PATROL_PUSH;
+      base.sy += s.patrolDirY * AI_CFG.PATROL_PUSH;
+      return base;
+    }
+
+    // Only start patrol if player is NOT close and we are hugging a wall/corner
+    const playerFar = d > AI_CFG.ORBIT_DIST * 0.9;
+    const onEdge = edge.inCorner || edge.L || edge.R || edge.T || edge.B;
+
+    if (playerFar && onEdge && s.patrolCool === 0){
+      // Choose a “safer band” inside the arena
+      const targetX = Math.min(
+        canvas.width - AI_CFG.SAFE_BAND,
+        Math.max(AI_CFG.SAFE_BAND, cx)
+      );
+      const targetY = Math.min(
+        canvas.height - AI_CFG.SAFE_BAND,
+        Math.max(AI_CFG.SAFE_BAND, cy)
+      );
+
+      // Bias away from the closer wall
+      let dirX = Math.sign(targetX - cx);
+      let dirY = Math.sign(targetY - cy);
+
+      // Small tangential component so they don’t drift straight into you
+      const tangX = -(pred.py - cy); // rotate by 90°
+      const tangY =  (pred.px - cx);
+      const tL = Math.hypot(tangX, tangY) || 1;
+      dirX = 0.75*dirX + 0.25*(tangX/tL);
+      dirY = 0.75*dirY + 0.25*(tangY/tL);
+      const n = Math.hypot(dirX,dirY)||1;
+
+      s.patrolDirX = dirX/n;
+      s.patrolDirY = dirY/n;
+      s.patrolTime = AI_CFG.PATROL_TIME;
+      s.patrolCool = AI_CFG.PATROL_COOLDOWN + Math.random()*0.5;
+    }
+
+    return base;
   }
 
-  // --- tiny randomness so they don't loop perfectly
-  steerX += (Math.random() - 0.5) * CFG.JITTER;
-  steerY += (Math.random() - 0.5) * CFG.JITTER;
 
-  // --- accelerate toward steer, with a touch of smoothing to avoid twitch
-  const sL = Math.hypot(steerX, steerY) || 1;
-  let ax = (steerX / sL), ay = (steerY / sL);
-  // blend with previous frame's steer for smoother headings
-  const SMOOTH = 0.65;
-  ax = ax * (1 - SMOOTH) + (t.lastSteerX || 0) * SMOOTH;
-  ay = ay * (1 - SMOOTH) + (t.lastSteerY || 0) * SMOOTH;
-  t.lastSteerX = ax; t.lastSteerY = ay;
+// MODULE 7.6: AI_INTEGRATE — smoothing, velocity, clamps
+function aiIntegrate(t, base, dt){
+  const s = t._ai;
 
+  // Wander & jitter
+  s.wanderTimer -= dt;
+  if (s.wanderTimer <= 0){
+    s.wanderTimer = AI_CFG.WANDER_T + Math.random()*0.6;
+    s.wanderPhase += (Math.random()-0.5)*1.1;
+  }
+  const wanderMag = (base.d > AI_CFG.ORBIT_DIST ? AI_CFG.WANDER_MAG_FAR : AI_CFG.WANDER_MAG_NEAR);
+  base.sx += Math.cos(s.wanderPhase)*wanderMag + (Math.random()-0.5)*AI_CFG.JITTER;
+  base.sy += Math.sin(s.wanderPhase)*wanderMag + (Math.random()-0.5)*AI_CFG.JITTER;
+
+  // Smooth steering
+  const sl = Math.hypot(base.sx, base.sy)||1;
+  let ax = base.sx/sl, ay = base.sy/sl;
+  ax = ax*(1-AI_CFG.SMOOTH) + s.lastSteerX*AI_CFG.SMOOTH;
+  ay = ay*(1-AI_CFG.SMOOTH) + s.lastSteerY*AI_CFG.SMOOTH;
+  s.lastSteerX = ax; s.lastSteerY = ay;
+
+  // Panic speed bump near player
+  const panic = base.d < 150 ? AI_CFG.PANIC_SPEED_UP : 1.0;
+
+  // Integrate vel
   t.vx += ax * CFG.TARGET_MAX_ACCEL * dt;
   t.vy += ay * CFG.TARGET_MAX_ACCEL * dt;
 
-  // cap speed
-  const vL = Math.hypot(t.vx, t.vy) || 1;
-  if (vL > CFG.TARGET_MAX_SPEED){
-    t.vx = (t.vx / vL) * CFG.TARGET_MAX_SPEED;
-    t.vy = (t.vy / vL) * CFG.TARGET_MAX_SPEED;
-  }
+  // Clamp speed
+  const maxV = CFG.TARGET_MAX_SPEED * panic;
+  const vL = Math.hypot(t.vx, t.vy)||1;
+  if (vL > maxV){ t.vx = (t.vx/vL)*maxV; t.vy = (t.vy/vL)*maxV; }
 
-  // move
+  // Move
   t.x += t.vx * dt; t.y += t.vy * dt;
 
-  // contain + soft bounce
-  if (t.x < 0){ t.x = 0; t.vx = Math.abs(t.vx) * 0.7; }
-  if (t.y < 0){ t.y = 0; t.vy = Math.abs(t.vy) * 0.7; }
-  if (t.x > canvas.width - t.w){ t.x = canvas.width - t.w; t.vx = -Math.abs(t.vx) * 0.7; }
-  if (t.y > canvas.height - t.h){ t.y = canvas.height - t.h; t.vy = -Math.abs(t.vy) * 0.7; }
+  // Bounds with soft bounce
+  if (t.x < 0){ t.x = 0; t.vx = Math.abs(t.vx)*0.7; }
+  if (t.y < 0){ t.y = 0; t.vy = Math.abs(t.vy)*0.7; }
+  if (t.x > canvas.width - t.w){ t.x = canvas.width - t.w; t.vx = -Math.abs(t.vx)*0.7; }
+  if (t.y > canvas.height - t.h){ t.y = canvas.height - t.h; t.vy = -Math.abs(t.vy)*0.7; }
 }
+
+
+// ========================
+// MODULE 7.7 PATCH: UPDATE
+// ========================
+// Replace your existing updateTargetAI body with this version so 7.8–7.11 are used.
+// Keep the function name identical (your game loop already calls it).
+function updateTargetAI(t, dt){
+  aiInit(t);           // 7.2
+  aiAssignSectors();   // 7.9 (no-op after first)
+
+  // keep the heatmap rolling
+  heatmapTick(dt);     // 7.10
+
+  const pred = aiPredictPlayer();           // 7.2
+  let base  = aiSteerBase(t, pred);         // 7.3
+
+  // Player distance bands for “when to waste time”
+  const playerFar = base.d > AI_CFG.ORBIT_DIST * 0.9;
+
+  // New layers
+  base = aiHeatmapBias(t, base);                    // 7.10
+  base = aiApplyDispersion(t, base);                // 7.11
+  base = aiSectorBias(t, base, playerFar, dt);      // 7.9
+
+  // Existing behaviors
+  base = aiApplyJuke(t, base, pred, dt);            // 7.4
+  base = aiApplyPatrol(t, base, pred, dt);          // 7.5
+  aiIntegrate(t, base, dt);                         // 7.6
+}
+
+
+// ===============================
+// MODULE 7.8: DIFFICULTY_PROFILES
+// ===============================
+const AI_PROFILE = {
+  // How much time-waste vs risk the AI aims for (tweak anytime)
+  name: "TimeWaste_Default",
+  HEATMAP_BIAS: 0.75,        // push away from your recent paths
+  SECTOR_STICK: 0.55,        // tendency to drift toward own sector when you're far
+  DISPERSION_MIN_SPACING: 110, // try to keep at least this px from neighbors near edges
+  DISPERSION_EDGE_FAN: 0.9,  // push to fan-out when sharing an edge
+  CORNER_IDLE_BUDGET: 0.6,   // (s) allowed near corner when player is far before leaving (7.13 will hard-enforce later)
+  JUKE_STAGGER_MIN: 0.25,    // (s) min stagger between enemies juking
+  JUKE_STAGGER_MAX: 0.55,    // (s) max stagger between enemies juking
+  HEATMAP_CELL: 80,          // px size of heatmap cells
+  HEATMAP_DECAY: 0.94,       // frame decay of heat
+  HEATMAP_PLAYER_STAMP: 2.6, // heat added near your position per tick
+  SECTOR_RING_RATIO: 0.34,   // sector “safe ring” radius vs arena min dimension
+  SECTOR_ROT_SPEED: 0.06,    // (rad/sec) slow rotation of sector anchors
+};
+
+// =======================
+// MODULE 7.9: SECTORS
+// =======================
+// Each enemy gets a "home sector" target that slowly rotates and sits on a safe ring
+// inside the arena. When you're far, they drift toward this point to avoid clumping.
+
+const _SECT = { assigned: false, t0: performance.now()/1000 };
+
+function aiAssignSectors(){
+  if (_SECT.assigned) return;
+  _SECT.assigned = true;
+  for (let i = 0; i < targets.length; i++){
+    const t = targets[i];
+    if (!t._ai) aiInit(t);
+    t._ai.sectorIndex = i;  // simple index-based partition (stable across session)
+  }
+}
+
+function aiSectorPointFor(t, timeSec){
+  const idx = t._ai?.sectorIndex ?? 0;
+  const N = Math.max(1, targets.length);
+  // ring radius based on arena
+  const arenaW = canvas.width, arenaH = canvas.height;
+  const ring = Math.min(arenaW, arenaH) * AI_PROFILE.SECTOR_RING_RATIO;
+
+  // center
+  const cx = arenaW * 0.5, cy = arenaH * 0.5;
+
+  // rotating slot angle
+  const baseAngle = (idx / N) * Math.PI * 2;
+  const rot = baseAngle + timeSec * AI_PROFILE.SECTOR_ROT_SPEED;
+
+  return { x: cx + Math.cos(rot)*ring, y: cy + Math.sin(rot)*ring };
+}
+
+function aiSectorBias(t, base, playerFar, dt){
+  // Only bias toward sector when player is far; keep it subtle
+  if (!playerFar) return base;
+  const now = performance.now()/1000 - _SECT.t0;
+  const p = aiSectorPointFor(t, now);
+  const toX = p.x - (t.x + t.w/2);
+  const toY = p.y - (t.y + t.h/2);
+  const L = Math.hypot(toX,toY) || 1;
+  const gain = AI_PROFILE.SECTOR_STICK;
+  base.sx += (toX/L) * gain;
+  base.sy += (toY/L) * gain;
+  return base;
+}
+
+// ========================
+// MODULE 7.10: HEATMAP
+// ========================
+// Rolling grid of your recent positions. Enemies bias away from "hot" lanes
+// so they don't ride the same edges/corners you just searched.
+
+const _HEAT = {
+  grid: null, cols: 0, rows: 0,
+  lastW: 0, lastH: 0,
+};
+
+function heatmapInit(){
+  const cell = AI_PROFILE.HEATMAP_CELL|0;
+  if (!cell) return;
+  const cols = Math.ceil(canvas.width / cell);
+  const rows = Math.ceil(canvas.height / cell);
+  _HEAT.cols = cols; _HEAT.rows = rows;
+  _HEAT.grid = new Float32Array(cols * rows);
+  _HEAT.lastW = canvas.width; _HEAT.lastH = canvas.height;
+}
+
+function heatmapEnsure(){
+  if (!_HEAT.grid || _HEAT.lastW !== canvas.width || _HEAT.lastH !== canvas.height){
+    heatmapInit();
+  }
+}
+
+function heatmapIdx(x, y){
+  const cell = AI_PROFILE.HEATMAP_CELL|0;
+  const c = Math.min(_HEAT.cols-1, Math.max(0, Math.floor(x / cell)));
+  const r = Math.min(_HEAT.rows-1, Math.max(0, Math.floor(y / cell)));
+  return r * _HEAT.cols + c;
+}
+
+function heatmapTick(dt){
+  heatmapEnsure();
+  if (!_HEAT.grid) return;
+
+  // Decay
+  const g = _HEAT.grid;
+  const decay = AI_PROFILE.HEATMAP_DECAY;
+  for (let i=0;i<g.length;i++){ g[i] *= decay; }
+
+  // Stamp player
+  const px = player.x + player.w/2, py = player.y + player.h/2;
+  const idx = heatmapIdx(px, py);
+  g[idx] += AI_PROFILE.HEATMAP_PLAYER_STAMP;
+}
+
+function heatmapSample(x, y){
+  heatmapEnsure();
+  if (!_HEAT.grid) return 0;
+  return _HEAT.grid[ heatmapIdx(x,y) ] || 0;
+}
+
+function aiHeatmapBias(t, base){
+  if (!_HEAT.grid) return base;
+
+  // Sample ahead and behind to approximate gradient
+  const cx = t.x + t.w/2, cy = t.y + t.h/2;
+  const s0 = heatmapSample(cx, cy);
+  const sX = heatmapSample(cx + 24, cy) - heatmapSample(cx - 24, cy);
+  const sY = heatmapSample(cy + 24, cx); // slight orthogonal smear
+  // Bias away from hotter direction (negative gradient)
+  base.sx += (-sX) * 0.02 * AI_PROFILE.HEATMAP_BIAS;
+  base.sy += (-sY) * 0.02 * AI_PROFILE.HEATMAP_BIAS;
+  return base;
+}
+
+// ===========================
+// MODULE 7.11: DISPERSION
+// ===========================
+// Avoid clumping on same edge/corner. When multiple enemies are near the same
+// edge, they "fan" into distinct lanes. Also encourages minimum spacing.
+
+function aiApplyDispersion(t, base){
+  const cx = t.x + t.w/2, cy = t.y + t.h/2;
+  const nearEdge =
+    (t.x < 12) || (t.y < 12) ||
+    (t.x > canvas.width - t.w - 12) ||
+    (t.y > canvas.height - t.h - 12);
+
+  if (!nearEdge) return base;
+
+  // Compute a simple lane vector along the closest edge
+  let edgeVX = 0, edgeVY = 0;
+  const dLeft   = t.x;
+  const dRight  = canvas.width - (t.x + t.w);
+  const dTop    = t.y;
+  const dBottom = canvas.height - (t.y + t.h);
+  const minD = Math.min(dLeft, dRight, dTop, dBottom);
+
+  if (minD === dLeft || minD === dRight){
+    // On vertical edge → lanes go along Y
+    edgeVX = 0; edgeVY = 1;
+  } else {
+    // On horizontal edge → lanes go along X
+    edgeVX = 1; edgeVY = 0;
+  }
+
+  // Push away from neighbors along tangential direction & enforce spacing
+  let tangentPush = 0;
+  let spaceX = 0, spaceY = 0;
+
+  for (let i=0;i<targets.length;i++){
+    const o = targets[i]; if (o===t) continue;
+    const ox = o.x + o.w/2, oy = o.y + o.h/2;
+    const dist = Math.hypot(cx-ox, cy-oy);
+    if (dist < AI_PROFILE.DISPERSION_MIN_SPACING){
+      // radial spacing push
+      const dx = cx - ox, dy = cy - oy;
+      const L = Math.hypot(dx,dy)||1;
+      spaceX += (dx/L) * ((AI_PROFILE.DISPERSION_MIN_SPACING - dist)/AI_PROFILE.DISPERSION_MIN_SPACING);
+      spaceY += (dy/L) * ((AI_PROFILE.DISPERSION_MIN_SPACING - dist)/AI_PROFILE.DISPERSION_MIN_SPACING);
+    }
+
+    // if both are near the same edge, fan out in opposite tangents
+    const oNearEdge = (o.x < 12) || (o.y < 12) ||
+      (o.x > canvas.width - o.w - 12) ||
+      (o.y > canvas.height - o.h - 12);
+
+    if (oNearEdge && nearEdge){
+      // signed distance along tangent
+      const along = ( (ox - cx) * edgeVX + (oy - cy) * edgeVY );
+      tangentPush += Math.sign(along || (Math.random()-0.5));
+    }
+  }
+
+  base.sx += (spaceX) * 1.0 + (edgeVX * tangentPush * AI_PROFILE.DISPERSION_EDGE_FAN);
+  base.sy += (spaceY) * 1.0 + (edgeVY * tangentPush * AI_PROFILE.DISPERSION_EDGE_FAN);
+
+  return base;
+}
+
 
 
 

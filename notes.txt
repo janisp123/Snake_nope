@@ -1,0 +1,173 @@
+// MODULE 7: AI (evasion++)
+// Goals:
+// - No more straight beeline to opposite corner
+// - Harder to corner: wall-slides, corner-pops, gap seeking
+// - Occasional feints (fast turns) but not spammy
+// - Mild flock separation so they don't clump
+
+function updateTargetAI(t, dt){
+  // --- Tunables
+  const SEP_RADIUS      = 90;    // separation distance
+  const SEP_FORCE       = 0.9;   // how strongly cubes repel each other
+  const WANDER_T        = 0.9;   // base time between wander ticks (adds jitter)
+  const WANDER_MAG_FAR  = 0.8;   // wander when far
+  const WANDER_MAG_NEAR = 0.35;  // wander when near
+  const ORBIT_DIST      = 260;   // start orbiting behavior inside this range
+  const ORBIT_FORCE     = 0.85;  // tangential orbit strength
+  const SLIDE_FORCE     = 1.15;  // stronger wall sliding
+  const CORNER_POP_DIST = 165;   // if pinned in corner and player close → pop
+  const CORNER_POP_TIME = 0.16;  // seconds of force burst
+  const CORNER_POP_COOL = 1.2;   // cooldown until next corner pop
+  const CORNER_POP_PUSH = 1.55;  // burst strength
+  const PANIC_SPEED_UP  = 1.12;  // allow slight speed cap increase when panicking
+  const JITTER          = 0.28;  // tiny randomness
+
+  // --- Lazy init per target
+  if (t._inited !== true){
+    t._inited = true;
+    t._wanderTimer = Math.random()*WANDER_T;
+    t._wanderPhase = Math.random()*Math.PI*2;
+    t._lastSteerX = 0; t._lastSteerY = 0;
+    t._popTime = 0; t._popCool = 0;
+  }
+
+  // --- Predict player future a bit (based on current keys)
+  // We avoid editing other modules by inferring intended player velocity from keys.
+  let pdir = 0, pdirx = 0, pdiry = 0;
+  if (typeof readInput === 'function'){
+    const di = readInput(); // normalized
+    pdirx = di.dx; pdiry = di.dy;
+    pdir = Math.hypot(pdirx, pdiry);
+  }
+  const lead = 0.22; // seconds to lead target prediction
+  const px = (player.x + player.w/2) + pdirx * player.speed * lead;
+  const py = (player.y + player.h/2) + pdiry * player.speed * lead;
+
+  const cx = t.x + t.w/2, cy = t.y + t.h/2;
+  const toX = px - cx, toY = py - cy;
+  const d   = Math.hypot(toX, toY) || 1;
+
+  // Base flee (soft) + orbiting (tangential) to avoid straight lines
+  const awayX = -toX / d, awayY = -toY / d;      // away from player
+  const tangX = -awayY,   tangY = awayX;         // perpendicular (orbit)
+
+  // Orbit more when inside ORBIT_DIST; flee more when very close
+  const near  = Math.min(1, Math.max(0, (ORBIT_DIST - d) / ORBIT_DIST));
+  let steerX  = awayX * (0.75 + 0.25*near) + tangX * (ORBIT_FORCE * near);
+  let steerY  = awayY * (0.75 + 0.25*near) + tangY * (ORBIT_FORCE * near);
+
+  // Separation: don't bunch
+  let sepX = 0, sepY = 0;
+  for (let i=0;i<targets.length;i++){
+    const o = targets[i]; if (o === t) continue;
+    const ox = (o.x + o.w/2), oy = (o.y + o.h/2);
+    const dx = cx - ox, dy = cy - oy;
+    const dist = Math.hypot(dx,dy);
+    if (dist > 0 && dist < SEP_RADIUS){
+      const s = (SEP_RADIUS - dist) / SEP_RADIUS;
+      sepX += (dx / dist) * s;
+      sepY += (dy / dist) * s;
+    }
+  }
+  if (sepX || sepY){
+    const sl = Math.hypot(sepX, sepY) || 1;
+    steerX += (sepX / sl) * SEP_FORCE;
+    steerY += (sepY / sl) * SEP_FORCE;
+  }
+
+  // Wall awareness: repel from walls and slide along them away from player
+  const nearLeft   = t.x < 10, nearRight = t.x > canvas.width - t.w - 10;
+  const nearTop    = t.y < 10, nearBottom= t.y > canvas.height - t.h - 10;
+
+  // Soft wall repel (keeps them off hard corners)
+  const repelMargin = 60;
+  if (t.x < repelMargin)           steerX +=  ( (cx > px) ? 0.4 : 0.2 );
+  if (t.x > canvas.width - t.w - repelMargin)  steerX +=  ( (cx < px) ? -0.4 : -0.2 );
+  if (t.y < repelMargin)           steerY +=  ( (cy > py) ? 0.4 : 0.2 );
+  if (t.y > canvas.height - t.h - repelMargin) steerY +=  ( (cy < py) ? -0.4 : -0.2 );
+
+  // Slide bias along walls (harder to pin)
+  if (nearLeft || nearRight){
+    steerY += (cy > py ? 1 : -1) * SLIDE_FORCE;
+  }
+  if (nearTop || nearBottom){
+    steerX += (cx > px ? 1 : -1) * SLIDE_FORCE;
+  }
+
+  // Corner pop: if close to a corner and player is on top of them, burst out diagonally
+  t._popCool = Math.max(0, t._popCool - dt);
+  t._popTime = Math.max(0, t._popTime - dt);
+
+  const inCorner = (nearLeft && nearTop) || (nearLeft && nearBottom) || (nearRight && nearTop) || (nearRight && nearBottom);
+  if (inCorner && d < CORNER_POP_DIST && t._popCool === 0 && t._popTime === 0){
+    // choose diagonal that increases distance from player and moves toward open space
+    const dirX = (nearLeft ? 1 : -1);
+    const dirY = (nearTop  ? 1 : -1);
+    const opt1 = {x: dirX,  y: dirY};
+    const opt2 = {x:-dirX,  y: dirY};
+    const opt3 = {x: dirX,  y:-dirY};
+    const opt4 = {x:-dirX,  y:-dirY};
+    const opts = [opt1,opt2,opt3,opt4];
+
+    // score options by resulting distance from predicted player point
+    let best = opts[0], bestScore = -Infinity;
+    for (const o of opts){
+      const s = (cx + o.x*40 - px)**2 + (cy + o.y*40 - py)**2; // simple heuristic
+      if (s > bestScore){ bestScore = s; best = o; }
+    }
+    t._popDirX = best.x; t._popDirY = best.y;
+    t._popTime = CORNER_POP_TIME;
+    t._popCool = CORNER_POP_COOL + Math.random()*0.5;
+  }
+  if (t._popTime > 0){
+    steerX += t._popDirX * CORNER_POP_PUSH;
+    steerY += t._popDirY * CORNER_POP_PUSH;
+  }
+
+  // Wander (adds gentle unpredictability; lower when near)
+  t._wanderTimer -= dt;
+  if (t._wanderTimer <= 0){
+    t._wanderTimer = WANDER_T + Math.random()*0.6;
+    t._wanderPhase += (Math.random() - 0.5) * 1.1;
+  }
+  const wanderMag = (d > ORBIT_DIST ? WANDER_MAG_FAR : WANDER_MAG_NEAR);
+  steerX += Math.cos(t._wanderPhase) * wanderMag;
+  steerY += Math.sin(t._wanderPhase) * wanderMag;
+
+  // Tiny randomness
+  steerX += (Math.random()-0.5) * JITTER;
+  steerY += (Math.random()-0.5) * JITTER;
+
+  // Smooth heading to avoid twitch
+  const sL = Math.hypot(steerX, steerY) || 1;
+  let ax = steerX / sL, ay = steerY / sL;
+  const SMOOTH = 0.6;
+  ax = ax*(1-SMOOTH) + (t._lastSteerX||0)*SMOOTH;
+  ay = ay*(1-SMOOTH) + (t._lastSteerY||0)*SMOOTH;
+  t._lastSteerX = ax; t._lastSteerY = ay;
+
+  // Panic speed allowance when very close
+  const panic = d < 150 ? PANIC_SPEED_UP : 1.0;
+
+  // Integrate velocity
+  t.vx += ax * CFG.TARGET_MAX_ACCEL * dt;
+  t.vy += ay * CFG.TARGET_MAX_ACCEL * dt;
+
+  // Cap speed (slightly higher in panic)
+  const maxV = CFG.TARGET_MAX_SPEED * panic;
+  const vL = Math.hypot(t.vx, t.vy) || 1;
+  if (vL > maxV){
+    t.vx = (t.vx / vL) * maxV;
+    t.vy = (t.vy / vL) * maxV;
+  }
+
+  // Move
+  t.x += t.vx * dt;
+  t.y += t.vy * dt;
+
+  // Contain + soft bounce
+  if (t.x < 0){ t.x = 0; t.vx = Math.abs(t.vx) * 0.7; }
+  if (t.y < 0){ t.y = 0; t.vy = Math.abs(t.vy) * 0.7; }
+  if (t.x > canvas.width - t.w){ t.x = canvas.width - t.w; t.vx = -Math.abs(t.vx) * 0.7; }
+  if (t.y > canvas.height - t.h){ t.y = canvas.height - t.h; t.vy = -Math.abs(t.vy) * 0.7; }
+}
